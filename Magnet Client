@@ -1,0 +1,113 @@
+--[[
+	MagneticObjectSystem — CLIENT
+
+	Only handles input and raycasting.
+	Physics live entirely on the server so they replicate properly.
+
+	Q  →  attract (holds object in front of you)
+	E  →  repel
+	R  →  orbit (toggle)
+--]]
+
+local RunService       = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Players           = game:GetService("Players")
+
+local player    = Players.LocalPlayer
+local camera    = workspace.CurrentCamera
+local character = player.Character or player.CharacterAdded:Wait()
+local hrp       = character:WaitForChild("HumanoidRootPart")
+
+-- Wait for the RemoteEvent the server creates on startup
+local MagnetRemote = ReplicatedStorage:WaitForChild("MagnetControl", 10)
+if not MagnetRemote then
+	warn("[MagnetClient] MagnetControl remote not found — is MagnetServer running?")
+	return
+end
+
+player.CharacterAdded:Connect(function(c)
+	character = c
+	hrp       = c:WaitForChild("HumanoidRootPart")
+end)
+
+-- ── Raycast ───────────────────────────────────────────────────
+
+local function MakeParams()
+	local p = RaycastParams.new()
+	p.FilterDescendantsInstances = { character }
+	p.FilterType = Enum.RaycastFilterType.Exclude
+	p.IgnoreWater = true
+	return p
+end
+
+local rayParams = MakeParams()
+player.CharacterAdded:Connect(function() rayParams = MakeParams() end)
+
+local RANGE = 150
+
+local function Scan()
+	if not hrp or not hrp.Parent then return nil end
+
+	local result = workspace:Raycast(
+		camera.CFrame.Position,
+		camera.CFrame.LookVector * RANGE,
+		rayParams
+	)
+	if not result then return nil end
+
+	local hit  = result.Instance
+	local part = hit:IsA("BasePart") and hit or hit:FindFirstAncestorWhichIsA("BasePart")
+	if not part then return nil end
+
+	-- Only interact with parts the server has marked as magnetic
+	if not part:GetAttribute("IsMagnetic") then return nil end
+	if (part.Position - hrp.Position).Magnitude > 100 then return nil end
+
+	return part
+end
+
+-- ── Input ─────────────────────────────────────────────────────
+
+local KEY_MAP = {
+	[Enum.KeyCode.Q] = "Attract",
+	[Enum.KeyCode.E] = "Repel",
+	[Enum.KeyCode.R] = "Orbit",
+}
+
+local debounce   = false
+local orbitActive = false   -- track toggle state locally for R
+
+UserInputService.InputBegan:Connect(function(input, processed)
+	if processed then return end
+	if input.UserInputType ~= Enum.UserInputType.Keyboard then return end
+
+	local action = KEY_MAP[input.KeyCode]
+	if not action then return end
+	if debounce then return end
+
+	debounce = true
+	task.delay(0.12, function() debounce = false end)
+
+	if action == "Orbit" then
+		if orbitActive then
+			-- Second R press releases the orbit
+			orbitActive = false
+			MagnetRemote:FireServer("Release", nil)
+		else
+			local part = Scan()
+			if part then
+				orbitActive = true
+				MagnetRemote:FireServer("Orbit", part)
+			end
+		end
+		return
+	end
+
+	-- Attract / Repel always re-scans and resets orbit toggle
+	orbitActive = false
+	local part = Scan()
+	if part then
+		MagnetRemote:FireServer(action, part)
+	end
+end)
