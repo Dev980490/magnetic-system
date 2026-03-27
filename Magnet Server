@@ -1,0 +1,288 @@
+--[[
+	MagneticObjectSystem — SERVER
+
+	Owns all physics. Uses VectorForce + spring simulation so motion
+	is smooth, mass-independent, and properly replicated to every client.
+
+	Attract  →  object floats to a hold point in front of the player
+	Repel    →  object pushed away from the player
+	Orbit    →  circular path around the player with a gentle Y wobble
+	Float    →  gravity is always cancelled once a part is controlled
+--]]
+
+local RunService        = game:GetService("RunService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Players           = game:GetService("Players")
+
+-- ── Remote ────────────────────────────────────────────────────
+
+local MagnetRemote = Instance.new("RemoteEvent")
+MagnetRemote.Name  = "MagnetControl"
+MagnetRemote.Parent = ReplicatedStorage
+
+-- ── Config ────────────────────────────────────────────────────
+
+local CFG = {
+	-- Spring coefficients — tuned for that slow, dreamy float
+	-- Stiffness: how eager the spring is to reach its target
+	-- Damping  : how quickly it absorbs oscillation
+	AttractStiffness = 22,   AttractDamping = 9,
+	RepelStiffness   = 18,   RepelDamping   = 6,
+	OrbitStiffness   = 32,   OrbitDamping   = 11,
+
+	-- The object floats to this distance in front of the player when attracting
+	HoldDistance = 7,   -- studs forward from HRP
+	HoldHeight   = 2.5, -- studs above HRP center
+
+	-- Minimum gap between part and player before attract force cuts off
+	StopRadius = 4,
+
+	OrbitRadius = 10,
+	OrbitSpeed  = 1.3,   -- rad/s — keep it relaxed
+
+	LeashRange  = 115,   -- auto-release beyond this
+	PlayerPolarity = "Positive",
+}
+
+local VALID_POLS = { Positive = true, Negative = true }
+
+-- ── Polarity setup ────────────────────────────────────────────
+
+local function EnsureAttributes(part)
+	if not part:GetAttribute("IsMagnetic") then
+		part:SetAttribute("IsMagnetic", true)
+	end
+	local pol = part:GetAttribute("Polarity")
+	if not pol or not VALID_POLS[pol] then
+		part:SetAttribute("Polarity", "Positive")
+	end
+end
+
+-- ── Physics drivers ───────────────────────────────────────────
+
+-- Each controlled part gets one Attachment + VectorForce.
+-- We stash them in the part so we can reuse without duplicating.
+
+local function GetForceDriver(part)
+	local att = part:FindFirstChild("_MagnetAtt")
+	if not att then
+		att        = Instance.new("Attachment")
+		att.Name   = "_MagnetAtt"
+		att.Parent = part
+	end
+
+	local vf = part:FindFirstChild("_MagnetForce")
+	if not vf then
+		vf                       = Instance.new("VectorForce")
+		vf.Name                  = "_MagnetForce"
+		vf.Attachment0           = att
+		vf.ApplyAtCenterOfMass   = true
+		vf.RelativeTo            = Enum.ActuatorRelativeTo.World
+		vf.Force                 = Vector3.zero
+		vf.Parent                = part
+	end
+
+	return vf
+end
+
+local function RemoveForceDriver(part)
+	if not part or not part.Parent then return end
+	local att = part:FindFirstChild("_MagnetAtt")
+	local vf  = part:FindFirstChild("_MagnetForce")
+	if vf  then vf:Destroy()  end
+	if att then att:Destroy() end
+end
+
+--[[
+	Spring force toward a world-space target.
+	Multiplying by mass keeps acceleration consistent regardless of part weight —
+	otherwise heavy parts would barely move and light ones would rocket.
+--]]
+local function SpringForce(part, targetPos, stiffness, damping)
+	local mass  = part.AssemblyMass
+	local disp  = targetPos - part.Position
+	local vel   = part.AssemblyLinearVelocity
+
+	-- Gravity cancellation keeps the part floating in place
+	local grav  = Vector3.new(0, workspace.Gravity * mass, 0)
+
+	-- Classic spring: F = k*x - b*v (scaled by mass for mass-independence)
+	local spring = (disp * stiffness - vel * damping) * mass
+
+	return grav + spring
+end
+
+-- ── Active state per player ───────────────────────────────────
+
+-- { mode, part, orbitAngle }  keyed by player
+local States = {}
+
+local function ClearState(player)
+	local s = States[player]
+	if not s then return end
+
+	if s.part and s.part.Parent then
+		-- Leave the part with a tiny upward nudge so it doesn't thud to the floor
+		local vf = s.part:FindFirstChild("_MagnetForce")
+		if vf then
+			-- let the spring gently cut — zero it next tick inside the leash guard
+			vf.Force = Vector3.zero
+		end
+		RemoveForceDriver(s.part)
+	end
+
+	States[player] = nil
+end
+
+-- ── Remote handler ────────────────────────────────────────────
+
+MagnetRemote.OnServerEvent:Connect(function(player, mode, targetPart)
+	-- Validate that the part is a real BasePart in the workspace owned by nobody sketchy
+	if mode ~= "Release" then
+		if not targetPart or not targetPart:IsA("BasePart") or not targetPart.Parent then
+			return
+		end
+		if not targetPart:GetAttribute("IsMagnetic") then
+			return
+		end
+	end
+
+	if mode == "Release" then
+		ClearState(player)
+		return
+	end
+
+	-- Clean up previous state (could be a different part or mode)
+	ClearState(player)
+
+	EnsureAttributes(targetPart)
+	targetPart.Anchored = false
+	GetForceDriver(targetPart)   -- create now so there's no first-frame lag
+
+	local orbitSeed = 0
+	if mode == "Orbit" then
+		local char = player.Character
+		local hrp  = char and char:FindFirstChild("HumanoidRootPart")
+		if hrp then
+			orbitSeed = math.atan2(
+				targetPart.Position.Z - hrp.Position.Z,
+				targetPart.Position.X - hrp.Position.X
+			)
+		end
+	end
+
+	States[player] = {
+		mode        = mode,
+		part        = targetPart,
+		orbitAngle  = orbitSeed,
+	}
+end)
+
+-- ── Heartbeat ─────────────────────────────────────────────────
+
+RunService.Heartbeat:Connect(function(dt)
+	for player, state in pairs(States) do
+		local part = state.part
+		if not part or not part.Parent then
+			States[player] = nil
+			continue
+		end
+
+		local char = player.Character
+		local hrp  = char and char:FindFirstChild("HumanoidRootPart")
+		if not hrp then continue end
+
+		local playerPos = hrp.Position
+		local dist      = (part.Position - playerPos).Magnitude
+
+		-- Auto-release if part wanders too far
+		if dist > CFG.LeashRange then
+			RemoveForceDriver(part)
+			States[player] = nil
+			continue
+		end
+
+		local vf = part:FindFirstChild("_MagnetForce")
+		if not vf then continue end
+
+		local targetPos
+		local stiffness, damping
+
+		-- ── Attract ──────────────────────────────────────────
+		if state.mode == "Attract" then
+			stiffness = CFG.AttractStiffness
+			damping   = CFG.AttractDamping
+
+			-- Hold point: float in front of and slightly above the player
+			-- Using HRP's CFrame keeps it relative to where they're facing
+			targetPos = hrp.CFrame:PointToWorldSpace(
+				Vector3.new(0, CFG.HoldHeight, -CFG.HoldDistance)
+			)
+
+			-- Add a slow breath-like bob so it never feels frozen
+			local bob = math.sin(tick() * 1.2) * 0.3
+			targetPos = targetPos + Vector3.new(0, bob, 0)
+
+			-- If the part is already very close to the hold point, zero force.
+			-- This prevents it tunnelling through the player.
+			if (part.Position - targetPos).Magnitude < CFG.StopRadius * 0.4 then
+				vf.Force = Vector3.new(0, workspace.Gravity * part.AssemblyMass, 0)
+				continue
+			end
+
+			-- ── Repel ─────────────────────────────────────────────
+		elseif state.mode == "Repel" then
+			stiffness = CFG.RepelStiffness
+			damping   = CFG.RepelDamping
+
+			-- Push to a point directly away from the player.
+			-- How far depends on distance — closer = stronger initial push.
+			local away    = (dist > 0.1) and (part.Position - playerPos).Unit or Vector3.new(1, 0, 0)
+			local pushDist = math.clamp(dist + 30, 20, 80)
+			targetPos = playerPos + away * pushDist
+
+			-- ── Orbit ─────────────────────────────────────────────
+		elseif state.mode == "Orbit" then
+			stiffness = CFG.OrbitStiffness
+			damping   = CFG.OrbitDamping
+
+			state.orbitAngle = state.orbitAngle + CFG.OrbitSpeed * dt
+
+			-- Gentle sine wobble on Y gives it that floaty, alive quality
+			local yWobble = math.sin(state.orbitAngle * 0.8) * 1.4
+
+			targetPos = playerPos + Vector3.new(
+				math.cos(state.orbitAngle) * CFG.OrbitRadius,
+				3 + yWobble,
+				math.sin(state.orbitAngle) * CFG.OrbitRadius
+			)
+		else
+			continue
+		end
+
+		vf.Force = SpringForce(part, targetPos, stiffness, damping)
+	end
+end)
+
+-- ── Cleanup on player leave ───────────────────────────────────
+
+Players.PlayerRemoving:Connect(function(player)
+	ClearState(player)
+end)
+
+-- ── Studio auto-tag ───────────────────────────────────────────
+
+local function TagAll()
+	for _, d in ipairs(workspace:GetDescendants()) do
+		if d:IsA("BasePart") and (d.Name == "MagnetPart" or d:GetAttribute("IsMagnetic")) then
+			EnsureAttributes(d)
+		end
+	end
+end
+
+TagAll()
+workspace.DescendantAdded:Connect(function(d)
+	if d:IsA("BasePart") and (d.Name == "MagnetPart" or d:GetAttribute("IsMagnetic")) then
+		task.defer(EnsureAttributes, d)
+	end
+end)
